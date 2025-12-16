@@ -67,6 +67,13 @@ async def lifespan(app: FastAPI):
         # Fail fast - don't start the API with an outdated database schema
         raise RuntimeError(f"Failed to run database migrations: {str(e)}") from e
 
+    # Start Daily Crawler Service
+    try:
+        from open_notebook.services.daily_crawler import daily_crawler_service
+        daily_crawler_service.start()
+    except Exception as e:
+        logger.error(f"Failed to start Daily Crawler Service: {e}")
+
     logger.success("API initialization completed successfully")
 
     # Yield control to the application
