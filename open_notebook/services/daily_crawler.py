@@ -1,8 +1,16 @@
 import asyncio
 import logging
+import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Set
+
+# Add the current directory to Python path so internal imports work
+current_dir = Path(__file__).parent.parent.parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -11,13 +19,13 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from api.sources_service import sources_service
+from api.notebook_service import notebook_service
 from open_notebook.domain.notebook import Source
 
 # List of sources to crawl (Subset from seed_data.py verified by user)
 CRAWL_SOURCES = [
     # GitHub Trending & Specific Repos
     "https://github.com/trending",
-    "https://github.com/thedotmack/claude-mem",
     
     # YouTube Channels
     "https://www.youtube.com/@LatentSpaceTV",
@@ -47,20 +55,43 @@ class DailyCrawlerService:
 
     def start(self):
         """Start the daily scheduler."""
-        # Schedule to run at 9:00 AM every day
+        # Schedule to run at 9:00 AM Beijing Time (UTC+8)
+        # Note: Docker containers usually run in UTC. 
+        # Using explicit timezone ensures it runs at the user's expected local time.
+        beijing_tz = timezone(timedelta(hours=8))
+        
         self.scheduler.add_job(
             self.run_daily_crawl,
-            CronTrigger(hour=9, minute=0),
+            CronTrigger(hour=9, minute=0, timezone=beijing_tz),
             id="daily_crawl",
             replace_existing=True
         )
         self.scheduler.start()
-        logger.info("Daily Crawler Service started. Scheduled for 09:00.")
+        
+        next_run = self.scheduler.get_job("daily_crawl").next_run_time
+        logger.info(f"Daily Crawler Service started. Scheduled for 09:00 Beijing Time. Next run: {next_run}")
 
     async def run_daily_crawl(self):
         """Main execution logic for daily crawl."""
         logger.info("Starting daily crawl execution...")
         
+        # Ensure we have a notebook for daily crawls
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        notebook_name = f"Daily Crawl {today_str}"
+        
+        notebooks = notebook_service.get_all_notebooks()
+        crawl_notebook = next((nb for nb in notebooks if nb.name == notebook_name), None)
+        
+        if not crawl_notebook:
+            logger.info(f"Creating '{notebook_name}' notebook...")
+            crawl_notebook = notebook_service.create_notebook(
+                name=notebook_name,
+                description=f"Notebook for automatically crawled sources on {today_str}."
+            )
+        
+        notebook_id = crawl_notebook.id
+        logger.info(f"Using notebook: {crawl_notebook.name} ({notebook_id})")
+
         discovered_urls = set()
 
         for source_url in CRAWL_SOURCES:
@@ -75,30 +106,19 @@ class DailyCrawlerService:
         count = 0
         for url in discovered_urls:
             # Check if source already exists to avoid duplicates
-            # Note: This is an optimization; duplicate checks might also exist in create_source logic
-            # but usually it's good to check here if efficient.
-            # For now, we'll try to create it, assuming service handles duplicates or we just handle errors.
             try:
-                # We need to check existence efficiently. 
-                # Since SourcesService doesn't have exist_by_url, we might skip or just try create.
-                # Let's try to create and catch potential duplication errors if they bubble up,
-                # or just let it process.
-                
-                # Check for recent YouTube videos (3 months)
+                # Check for recent YouTube videos (1 week)
                 if "youtube.com" in url or "youtu.be" in url:
                     if not await self._is_video_recent(url):
                         logger.debug(f"Skipping old video: {url}")
                         continue
 
                 # Create the source
-                # We don't have a specific notebook_id, so it might be created as an orphaned source 
-                # or we might need a default 'Daily Crawl' notebook?
-                # The user request said "execute create source operation", implies just adding to the system.
-                
-                await sources_service.create_source(
+                sources_service.create_source(
                     url=url,
                     source_type="link",
                     title=None, # Will be fetched
+                    notebook_id=notebook_id,
                     async_processing=True # Use async to accept crawling logic we added before
                 )
                 count += 1
@@ -121,7 +141,6 @@ class DailyCrawlerService:
                 links = self._parse_github_trending(html)
             elif "github.com" in url:
                 # It's a specific repo, just add itself if it's not already the url
-                # Use request URL effectively
                 links = [url]
             elif "youtube.com" in url:
                 links = self._parse_youtube_channel(html)
@@ -151,7 +170,7 @@ class DailyCrawlerService:
         return [f"https://www.youtube.com/watch?v={vid}" for vid in video_ids]
 
     async def _is_video_recent(self, url: str) -> bool:
-        """Check if YouTube video is published within last 3 months."""
+        """Check if YouTube video is published within last week."""
         try:
             # We need to fetch the video page to get the date
             resp = await self.client.get(url, follow_redirects=True)
@@ -169,22 +188,18 @@ class DailyCrawlerService:
                 date_str = date_meta.get('content')
             
             if not date_str:
-                return True # If can't find date, assume it's okay/safe to include or risk it? User said "only 3 months".
-                            # Safer to return False if unsure, OR check for "x months ago" text.
-                            # Let's perform a stricter check.
                 return False
 
             # Parse date (ISO 8601 usually YYYY-MM-DD or full datetime)
-            # Remove time component for simplicity
             if 'T' in date_str:
                 date_str = date_str.split('T')[0]
                 
             pub_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             
             # Check delta
-            three_months_ago = datetime.now(timezone.utc) - timedelta(days=90)
+            one_week_ago = datetime.now(timezone.utc) - timedelta(days=7)
             
-            return pub_date >= three_months_ago
+            return pub_date >= one_week_ago
             
         except Exception as e:
             logger.warning(f"Failed to verify video date for {url}: {e}")
@@ -192,3 +207,10 @@ class DailyCrawlerService:
 
 # Global instance
 daily_crawler_service = DailyCrawlerService()
+
+if __name__ == "__main__":
+    async def main():
+        service = DailyCrawlerService()
+        await service.run_daily_crawl()
+    
+    asyncio.run(main())
